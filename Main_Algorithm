@@ -1,0 +1,203 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+
+typedef struct Page {
+    int tenant_id;
+    int page_id;
+    int access_history[2];
+    int access_history_size;
+    struct Page* prev;
+    struct Page* next;
+} Page;
+
+typedef struct Tenant {
+    int priority;
+    int db_size;
+    int q_min;
+    int q_base;
+    int q_max;
+} Tenant;
+
+typedef struct RealTimeCache {
+    int Q;
+    Tenant** tenants;
+    int K;
+    int current_buffer_size;
+    Page* buffer;
+    Page** hash_table;
+    int* tenant_page_counts;
+    int timestamp;
+} RealTimeCache;
+
+unsigned int hash(int tenant_id, int page_id) {
+    return (unsigned int)(tenant_id * 31 + page_id);
+}
+
+Page* find_page(RealTimeCache* cache, int tenant_id, int page_id) {
+    unsigned int index = hash(tenant_id, page_id) % cache->Q;
+    Page* page = cache->hash_table[index];
+    while (page != NULL) {
+        if (page->tenant_id == tenant_id && page->page_id == page_id) {
+            return page;
+        }
+        page = page->next;
+    }
+    return NULL;
+}
+
+void insert_page(RealTimeCache* cache, Page* page) {
+    unsigned int index = hash(page->tenant_id, page->page_id) % cache->Q;
+    page->next = cache->hash_table[index];
+    if (cache->hash_table[index] != NULL) {
+        cache->hash_table[index]->prev = page;
+    }
+    cache->hash_table[index] = page;
+}
+
+void remove_page(RealTimeCache* cache, Page* page) {
+    unsigned int index = hash(page->tenant_id, page->page_id) % cache->Q;
+    if (page->prev != NULL) {
+        page->prev->next = page->next;
+    } else {
+        cache->hash_table[index] = page->next;
+    }
+    if (page->next != NULL) {
+        page->next->prev = page->prev;
+    }
+}
+
+int find_eviction_index(RealTimeCache* cache) {
+    int eviction_index = -1;
+    int min_timestamp = INT_MAX;
+
+    // Original eviction logic
+    for (size_t i = 0; i < cache->Q; ++i) {
+        int current_tenant_id = cache->buffer[i].tenant_id;
+        int tenant_pages = cache->tenant_page_counts[current_tenant_id];
+
+        if (tenant_pages > cache->tenants[current_tenant_id - 1]->q_min) {
+            int current_timestamp = cache->buffer[i].access_history[0];
+            if (current_timestamp < min_timestamp) {
+                eviction_index = i;
+                min_timestamp = current_timestamp;
+            }
+        }
+    }
+
+    // Fallback to LFU if no suitable eviction index is found
+    if (eviction_index == -1) {
+        int min_access_count = INT_MAX;
+        for (size_t i = 0; i < cache->Q; ++i) {
+            int access_count = cache->buffer[i].access_history_size;
+            if (access_count < min_access_count) {
+                eviction_index = i;
+                min_access_count = access_count;
+            }
+        }
+    }
+
+    // Fallback to Random Replacement (RR) if LFU fails to find an eviction index
+    if (eviction_index == -1) {
+        srand(time(0));
+        eviction_index = rand() % cache->Q;
+    }
+
+    return eviction_index;
+}
+
+
+int eviction(RealTimeCache* cache, const Page* operation) {
+    int tenant_id = operation->tenant_id;
+
+    Page* page = find_page(cache, tenant_id, operation->page_id);
+    if (page != NULL) {
+        if (page->access_history_size >= 2) {
+            page->access_history[0] = page->access_history[1];
+            page->access_history[1] = cache->timestamp;
+        } else {
+            page->access_history[page->access_history_size++] = cache->timestamp;
+        }
+        cache->timestamp++;
+        return (int)(page - cache->buffer) + 1;
+    }
+
+    if (cache->current_buffer_size < cache->Q) {
+        Page* new_page = &cache->buffer[cache->current_buffer_size++];
+        *new_page = *operation;
+        new_page->access_history[0] = cache->timestamp++;
+        new_page->access_history_size = 1;
+        new_page->prev = NULL;
+        new_page->next = NULL;
+        insert_page(cache, new_page);
+        cache->tenant_page_counts[tenant_id]++;
+        return cache->current_buffer_size;
+    }
+
+    int evict_index = find_eviction_index(cache);
+    Page* evicted_page = &cache->buffer[evict_index];
+
+    cache->tenant_page_counts[evicted_page->tenant_id]--;
+    remove_page(cache, evicted_page);
+
+    *evicted_page = *operation;
+    evicted_page->access_history[0] = cache->timestamp++;
+    evicted_page->access_history_size = 1;
+    evicted_page->prev = NULL;
+    evicted_page->next = NULL;
+    insert_page(cache, evicted_page);
+    cache->tenant_page_counts[tenant_id]++;
+    return evict_index + 1;
+}
+
+RealTimeCache create_real_time_cache(int Q, Tenant** tenants, int K) {
+    RealTimeCache cache;
+    cache.Q = Q;
+    cache.tenants = tenants;
+    cache.K = K;
+    cache.current_buffer_size = 0;
+    cache.buffer = (Page*)malloc(Q * sizeof(Page));
+    cache.hash_table = (Page**)calloc(Q, sizeof(Page*));
+    cache.tenant_page_counts = (int*)calloc(Q, sizeof(int));
+    cache.timestamp = 0;
+    return cache;
+}
+
+int main() {
+    int N, Q, M;
+    scanf("%d %d %d", &N, &Q, &M);
+    Tenant tenant_objects[N];
+    Tenant* tenants[N];
+    for (int i = 0; i < N; ++i) {
+        scanf("%d", &tenant_objects[i].priority);
+        tenants[i] = &tenant_objects[i];
+    }
+    for (int i = 0; i < N; ++i) {
+        scanf("%d", &tenant_objects[i].db_size);
+    }
+    for (int i = 0; i < N; ++i) {
+        scanf("%d %d %d", &tenant_objects[i].q_min, &tenant_objects[i].q_base, &tenant_objects[i].q_max);
+    }
+
+    RealTimeCache real_time_cache = create_real_time_cache(Q, tenants, 0);
+
+    for (int i = 0; i < M; ++i) {
+        int tenant_id, page_id;
+        scanf("%d %d", &tenant_id, &page_id);
+        Page operation = {tenant_id, page_id, {0, 0}, 0, NULL, NULL};
+
+        int result = eviction(&real_time_cache, &operation);
+        printf("%d\n", result);
+        fflush(stdout);
+    }
+
+    free(real_time_cache.buffer);
+    free(real_time_cache.hash_table);
+    free(real_time_cache.tenant_page_counts);
+
+    return 0;
+}
